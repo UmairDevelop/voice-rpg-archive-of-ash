@@ -25,7 +25,7 @@ class TTSVoiceEngine:
         self.voice_id = voice_id
         self.edge_voice = edge_voice
 
-    async def generate_speech_audio(self, text: str, output_path: str = "temp_speech.mp3") -> Tuple[bool, str, str]:
+    async def generate_speech_audio(self, text: str, output_path: Optional[str] = None) -> Tuple[bool, str, str]:
         """
         Cleans text and generates audio file.
         Returns (success, cleaned_text, file_path_or_error)
@@ -33,6 +33,21 @@ class TTSVoiceEngine:
         cleaned_text = clean_text_for_speech(text)
         if not cleaned_text or len(cleaned_text.strip()) == 0:
             return False, "", "Empty cleaned text."
+
+        if not output_path:
+            import time
+            output_path = f"temp_speech_{time.time_ns()}.mp3"
+
+        # Attempt stale file cleanup
+        try:
+            for fname in os.listdir("."):
+                if fname.startswith("temp_speech_") and fname.endswith(".mp3") and fname != output_path:
+                    try:
+                        os.remove(fname)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
 
         # 1. Try ElevenLabs streaming if API key present
         if self.api_key:

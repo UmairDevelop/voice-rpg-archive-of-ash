@@ -31,13 +31,69 @@ def reload_env_vars():
 
 reload_env_vars()
 
-ARCHIVIST_TOOLS = [
-    EvaluateSkillCheck,
-    SubmitPowerAllocation,
-    ProposeAction,
-    UpdateRelationship,
-    RequestHint,
+ARCHIVIST_FUNCTION_DECLARATIONS = [
+    types.FunctionDeclaration(
+        name="evaluate_skill_check",
+        description="Evaluate a player skill check (stat: perception, intelligence, persuasion, security) against a DC.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "stat_name": types.Schema(type="STRING", description="Target stat"),
+                "target_dc": types.Schema(type="INTEGER", description="Difficulty Class threshold")
+            },
+            required=["stat_name", "target_dc"]
+        )
+    ),
+    types.FunctionDeclaration(
+        name="submit_power_allocation",
+        description="Submit power allocation values in MW for Security, Memory, and Cooling power subsystems.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "security_mw": types.Schema(type="NUMBER", description="Power to security in MW"),
+                "memory_mw": types.Schema(type="NUMBER", description="Power to memory in MW"),
+                "cooling_mw": types.Schema(type="NUMBER", description="Power to cooling in MW")
+            },
+            required=["security_mw", "memory_mw", "cooling_mw"]
+        )
+    ),
+    types.FunctionDeclaration(
+        name="propose_action",
+        description="Propose a general player action in the encounter.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "action_type": types.Schema(type="STRING", description="Action category"),
+                "details": types.Schema(type="STRING", description="Specific action details")
+            },
+            required=["action_type"]
+        )
+    ),
+    types.FunctionDeclaration(
+        name="update_relationship",
+        description="Update the trust relationship score with the Archivist.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "delta": types.Schema(type="NUMBER", description="Change in trust level"),
+                "reason": types.Schema(type="STRING", description="Reason for trust shift")
+            },
+            required=["delta"]
+        )
+    ),
+    types.FunctionDeclaration(
+        name="request_hint",
+        description="Request a hint from the Archivist regarding power grid or vault door.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "topic": types.Schema(type="STRING", description="Topic of hint")
+            }
+        )
+    )
 ]
+
+ARCHIVIST_TOOLS = [types.Tool(function_declarations=ARCHIVIST_FUNCTION_DECLARATIONS)]
 
 
 class ArchivistAgent:
@@ -50,7 +106,7 @@ class ArchivistAgent:
         self,
         validator: Optional[EngineValidator] = None,
         api_key: Optional[str] = None,
-        model_name: str = "gemini-2.5-flash"
+        model_name: str = "gemini-3.6-flash"
     ):
         self.validator = validator or EngineValidator()
         self.retriever = LoreRetriever()
@@ -65,6 +121,8 @@ class ArchivistAgent:
 
     def _check_and_init_client(self):
         """Dynamically re-checks environment variables for GEMINI_API_KEY."""
+        if self.client is not None:
+            return
         reload_env_vars()
         key = self.api_key or os.environ.get("GEMINI_API_KEY", "")
         if key and key.strip() and key != "your_gemini_api_key_here":
@@ -77,7 +135,8 @@ class ArchivistAgent:
                 self.client = None
 
     def is_api_key_configured(self) -> bool:
-        self._check_and_init_client()
+        if self.client is None:
+            self._check_and_init_client()
         return self.client is not None
 
     def process_turn(
@@ -110,7 +169,12 @@ class ArchivistAgent:
 
         # 2. World state summary
         world_state = self.validator.get_state()
+        game_solved = world_state.puzzle_state.is_solved or world_state.vault_state.value == "OPEN" or world_state.access_granted or world_state.trust_level >= 75.0
+        
+        status_flag = "COMPLETED & SOLVED! Vault door is OPEN and schematics are retrieved. Tell the player the task is finished and they can move on." if game_solved else "IN PROGRESS - Vault is sealed. Guide player on power grid or building trust."
+
         state_summary = (
+            f"Game Status: {status_flag} | "
             f"Vault State: {world_state.vault_state.value} | "
             f"Trust Level: {world_state.trust_level:.1f}/100 | "
             f"Puzzle Solved: {world_state.puzzle_state.is_solved} | "
@@ -143,16 +207,29 @@ class ArchivistAgent:
             self.state_graph.on_tool_executed(tool_validation_res.success, is_puzzle=is_puzzle, session_over=session_over)
 
             if not text_response or len(text_response.strip()) == 0:
-                text_response = tool_validation_res.message
+                if tool_name in ["submit_power_allocation", "request_hint"]:
+                    text_response = tool_validation_res.message
+                else:
+                    synth_prompt = (
+                        f"[CONTEXT]\nAction executed: {tool_name} with result: {tool_validation_res.message}\n"
+                        f"[PLAYER QUESTION]: '{user_input}'\n\n"
+                        f"Answer the player's question directly as Archivist in 1-2 natural, warm spoken sentences."
+                    )
+                    synth_text, _, _ = self._call_gemini_api(synth_prompt)
+                    if synth_text and len(synth_text.strip()) > 0 and "schema" not in synth_text.lower():
+                        text_response = synth_text
+                    else:
+                        text_response = tool_validation_res.message
         else:
             session_over = self.validator.get_state().is_terminal_state()
             self.state_graph.on_model_emitted(has_tool_call=False, session_over=session_over)
 
-        if not text_response:
-            text_response = "Archivist core telemetry acknowledged. State your inquiry."
+        # 5. Fallback ONLY if Gemini returned no text or technical error
+        if not text_response or any(err in text_response.lower() for err in ["schema error", "validation error", "unknown tool", "function_declarations"]):
+            text_response = "I didn't get that, can you repeat?"
 
         turn_log = {
-            "player": user_input if not is_audio else "Spoken Voice Input",
+            "player": user_input if (user_input and user_input != "Voice audio input...") else "Player spoke via voice input",
             "archivist": text_response,
             "tool_call": tool_call,
             "tool_result": tool_validation_res.model_dump() if tool_validation_res else None,
@@ -167,43 +244,74 @@ class ArchivistAgent:
         prompt: str,
         audio_bytes: Optional[bytes] = None
     ) -> Tuple[str, Optional[Dict[str, Any]], Dict[str, Any]]:
-        metrics = {"latency_sec": 0.05, "prompt_tokens": 120, "candidates_tokens": 40, "estimated_cost": 0.0001}
+        models_to_try = [
+            self.model_name,
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.7-flash",
+            "gemini-3.8-flash",
+            "gemini-flash-latest",
+        ]
+        last_exception = None
 
-        try:
-            config = types.GenerateContentConfig(
-                system_instruction=ARCHIVIST_SYSTEM_PROMPT,
-                tools=ARCHIVIST_TOOLS,
-                temperature=0.7,
-            )
+        for m_name in models_to_try:
+            try:
+                config = types.GenerateContentConfig(
+                    system_instruction=ARCHIVIST_SYSTEM_PROMPT,
+                    tools=ARCHIVIST_TOOLS,
+                    temperature=0.7,
+                )
 
-            contents = []
-            if audio_bytes:
-                contents.append(types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"))
-            contents.append(prompt)
+                contents = []
+                # Include multi-turn conversation memory (up to last 6 valid turns)
+                for turn in self.chat_history[-6:]:
+                    u_t = turn.get("player", "")
+                    m_t = turn.get("archivist", "")
 
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=contents,
-                config=config,
-            )
+                    if not u_t or u_t == "Voice audio input...":
+                        u_t = "Player spoke via voice input."
 
-            text_out = response.text or ""
-            tool_call_out = None
+                    # Skip failed/fallback turns to keep history clean
+                    if not m_t or m_t.startswith("I didn't get that") or m_t.startswith("[API KEY REQUIRED]"):
+                        continue
 
-            if response.function_calls:
-                fc = response.function_calls[0]
-                tool_call_out = {
-                    "name": fc.name,
-                    "args": dict(fc.args) if fc.args else {},
-                }
+                    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=u_t)]))
+                    contents.append(types.Content(role="model", parts=[types.Part.from_text(text=m_t)]))
 
-            if response.usage_metadata:
-                metrics["prompt_tokens"] = response.usage_metadata.prompt_token_count
-                metrics["candidates_tokens"] = response.usage_metadata.candidates_token_count
-                metrics["estimated_cost"] = (metrics["prompt_tokens"] * 0.00000015) + (metrics["candidates_tokens"] * 0.0000006)
+                curr_parts = []
+                if audio_bytes:
+                    curr_parts.append(types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"))
+                curr_parts.append(types.Part.from_text(text=prompt))
+                contents.append(types.Content(role="user", parts=curr_parts))
 
-            return text_out, tool_call_out, metrics
+                response = self.client.models.generate_content(
+                    model=m_name,
+                    contents=contents,
+                    config=config,
+                )
 
-        except Exception as e:
-            logger.error(f"Gemini API execution error: {e}")
-            return f"[GEMINI API ERROR] {str(e)}", None, metrics
+                text_out = response.text or ""
+                tool_call_out = None
+
+                if response.function_calls:
+                    fc = response.function_calls[0]
+                    tool_call_out = {
+                        "name": fc.name,
+                        "args": dict(fc.args) if fc.args else {},
+                    }
+
+                metrics = {"latency_sec": 0.05, "prompt_tokens": 120, "candidates_tokens": 40, "estimated_cost": 0.0001}
+                if response.usage_metadata:
+                    metrics["prompt_tokens"] = response.usage_metadata.prompt_token_count
+                    metrics["candidates_tokens"] = response.usage_metadata.candidates_token_count
+                    metrics["estimated_cost"] = (metrics["prompt_tokens"] * 0.00000015) + (metrics["candidates_tokens"] * 0.0000006)
+
+                return text_out, tool_call_out, metrics
+            except Exception as e:
+                logger.warning(f"Gemini API model {m_name} failed: {e}. Trying fallback model...")
+                last_exception = e
+
+        logger.error(f"All Gemini models failed: {last_exception}")
+        metrics = {"latency_sec": 0.05, "prompt_tokens": 0, "candidates_tokens": 0, "estimated_cost": 0.0}
+        
+        return "I didn't get that, can you repeat?", None, metrics

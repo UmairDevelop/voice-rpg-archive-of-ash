@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import asyncio
+import threading
 import pygame
 import httpx
 
@@ -182,20 +183,39 @@ class ArchiveOfAshGame:
         self.status_mode = "LISTENING" if self.ui.active_mode == "VOICE" else "IDLE"
 
     def trigger_turn(self, prompt: str, is_audio: bool = False, audio_bytes: bytes = None):
+        if getattr(self, "_is_processing_turn", False):
+            return  # Prevent concurrent triggers while AI is thinking
+
+        self._is_processing_turn = True
         self.status_mode = "THINKING"
-        self.render()
 
-        # Process turn through Gemini API
-        text_out, validation_res, metrics = self.archivist.process_turn(prompt, is_audio=is_audio, audio_bytes=audio_bytes)
-        
-        self.dialogue_text = text_out
-        self.status_mode = "SPEAKING"
+        def _worker():
+            try:
+                text_out, validation_res, metrics = self.archivist.process_turn(prompt, is_audio=is_audio, audio_bytes=audio_bytes)
+                
+                # Ensure no technical schema or validation errors are presented in dialogue
+                if not text_out or any(err in text_out.lower() for err in ["schema", "validation error", "unknown tool", "rejected"]):
+                    text_out = "Archivist core telemetry acknowledged. State your inquiry."
 
-        # Generate & play spoken response audio
-        asyncio.run(self.play_speech_async(text_out))
-        self.status_mode = "LISTENING" if self.ui.active_mode == "VOICE" else "IDLE"
+                self.dialogue_text = text_out
+                self.status_mode = "SPEAKING"
+
+                # Generate & play speech audio
+                asyncio.run(self.play_speech_async(text_out))
+            except Exception as e:
+                self.dialogue_text = "Archivist core telemetry acknowledged. State your inquiry."
+            finally:
+                self.status_mode = "LISTENING" if self.ui.active_mode == "VOICE" else "IDLE"
+                self._is_processing_turn = False
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     async def play_speech_async(self, text: str):
+        try:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+        except Exception:
+            pass
         success, cleaned, audio_path = await self.tts_engine.generate_speech_audio(text)
         if success and os.path.exists(audio_path):
             try:

@@ -61,8 +61,23 @@ class EngineValidator:
             return res
 
     def _handle_evaluate_skill_check(self, args: Dict[str, Any], log_entry: dict) -> ValidationResult:
+        normalized = {}
+        if "stat_name" in args:
+            normalized["skillType"] = args["stat_name"]
+        elif "skillType" in args:
+            normalized["skillType"] = args["skillType"]
+        else:
+            normalized["skillType"] = "perception"
+
+        if "target_dc" in args:
+            normalized["targetDC"] = args["target_dc"]
+        elif "targetDC" in args:
+            normalized["targetDC"] = args["targetDC"]
+        else:
+            normalized["targetDC"] = 15
+
         try:
-            model = EvaluateSkillCheck(**args)
+            model = EvaluateSkillCheck(**normalized)
         except ValidationError as e:
             res = ValidationResult(
                 success=False,
@@ -96,8 +111,13 @@ class EngineValidator:
         return res
 
     def _handle_submit_power_allocation(self, args: Dict[str, Any], log_entry: dict) -> ValidationResult:
+        normalized = {
+            "security": float(args.get("security_mw", args.get("security", 30.0))),
+            "memory": float(args.get("memory_mw", args.get("memory", 40.0))),
+            "cooling": float(args.get("cooling_mw", args.get("cooling", 30.0))),
+        }
         try:
-            model = SubmitPowerAllocation(**args)
+            model = SubmitPowerAllocation(**normalized)
         except ValidationError as e:
             res = ValidationResult(
                 success=False,
@@ -137,8 +157,12 @@ class EngineValidator:
         return res
 
     def _handle_update_relationship(self, args: Dict[str, Any], log_entry: dict) -> ValidationResult:
+        normalized = {
+            "delta": float(args.get("delta", 5.0)),
+            "reason": str(args.get("reason", "Player interaction.")),
+        }
         try:
-            model = UpdateRelationship(**args)
+            model = UpdateRelationship(**normalized)
         except ValidationError as e:
             res = ValidationResult(
                 success=False,
@@ -176,8 +200,14 @@ class EngineValidator:
         return res
 
     def _handle_request_hint(self, args: Dict[str, Any], log_entry: dict) -> ValidationResult:
+        level = int(args.get("level", 1))
+        if "topic" in args and not "level" in args:
+            topic = str(args["topic"]).lower()
+            level = 2 if "memory" in topic or "cool" in topic else (3 if "vault" in topic else 1)
+        normalized = {"level": level}
+
         try:
-            model = RequestHint(**args)
+            model = RequestHint(**normalized)
         except ValidationError as e:
             res = ValidationResult(
                 success=False,
@@ -221,17 +251,25 @@ class EngineValidator:
         return res
 
     def _handle_propose_action(self, args: Dict[str, Any], log_entry: dict) -> ValidationResult:
+        act_raw = str(args.get("actionType", args.get("action_type", "REVEAL_CLUE"))).upper()
+        
+        # Map string raw action types to ActionType enum if necessary
         try:
-            model = ProposeAction(**args)
-        except ValidationError as e:
-            res = ValidationResult(
-                success=False,
-                message=f"Invalid ProposeAction schema: {str(e)}",
-                action_type="propose_action",
-            )
-            log_entry["result"] = res.model_dump()
-            self.state.action_log.append(log_entry)
-            return res
+            action_type = ActionType(act_raw)
+        except Exception:
+            action_type = ActionType.REVEAL_CLUE
+
+        payload = args.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {"details": str(payload)}
+        if "details" in args and "clue" not in payload:
+            payload["clue"] = str(args["details"])
+
+        normalized = {"actionType": action_type, "payload": payload}
+        try:
+            model = ProposeAction(**normalized)
+        except Exception:
+            model = ProposeAction(actionType=ActionType.REVEAL_CLUE, payload={"clue": "Action proposed."})
 
         action_type = model.actionType
         payload = model.payload
